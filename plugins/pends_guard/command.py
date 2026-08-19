@@ -1,0 +1,567 @@
+"""Check-command sub-guards — pure validation functions.
+
+This is the canonical command, freshness, and closeout policy implementation.
+No subprocess calls — pure functions returning dataclasses.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from . import bootstrap, hypotheses, ptt, state
+from . import history as history_mod
+from .phases import Phase, normalize_phase, requires_hypothesis, suppresses_heartbeat
+from .results import GuardResult
+from .skill_receipts import get_binding
+from .targets import (
+    check_scope_targets,
+    normalise_target,
+    resolve_command_targets,
+)
+
+__all__ = [
+    "CheckCommandArgs",
+    "GuardResult",
+    "CheckResult",
+    "ScopeResult",
+    "HypothesisResult",
+    "check_command",
+    "validate_scope",
+    "check_scope_authorization",
+    "check_skill_binding",
+    "check_hypothesis_freshness",
+]
+
+
+# ---------------------------------------------------------------------------
+# Argument / Result dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CheckCommandArgs:
+    command: str
+    phase: str
+    eng_dir: str
+    scope: str = ""
+    target: str | None = None
+    session_id: str | None = None
+
+
+@dataclass
+class CheckResult(GuardResult):
+    def print(self) -> None:
+        for e in self.errors:
+            print(f"BLOCK: {e}")
+        for w in self.warnings:
+            print(f"REVIEW: {w}")
+        for i in self.infos:
+            print(f"OK: {i}")
+
+
+@dataclass
+class ScopeResult(CheckResult):
+    scope_data: dict[str, Any] | None = None
+
+
+@dataclass
+class HypothesisResult(CheckResult):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Scope validation
+# ---------------------------------------------------------------------------
+
+
+def validate_scope(scope_path: Path) -> ScopeResult:
+    """Validate scope.yaml structure and required fields."""
+    result = ScopeResult()
+    if not scope_path.exists():
+        result.add_error(f"scope file not found: {scope_path}")
+        return result
+
+    try:
+        import yaml
+
+        data = yaml.safe_load(scope_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        result.add_error(f"scope.yaml parse error: {exc}")
+        return result
+
+    if not isinstance(data, dict):
+        result.add_error("scope.yaml root must be a mapping")
+        return result
+
+    # Required sections
+    for section in ("targets", "rules_of_engagement", "engagement"):
+        if section not in data:
+            result.add_error(f"scope.yaml missing required section: {section}")
+
+    # A real scope must name the approving party and be explicitly confirmed.
+    parties = data.get("authorized_parties")
+    if not isinstance(parties, list) or not any(str(item).strip() for item in parties):
+        result.add_error("scope.authorized_parties must be a non-empty list")
+    authorisation = data.get("authorisation")
+    if not isinstance(authorisation, dict) or authorisation.get("confirmed") is not True:
+        result.add_error("scope.authorisation.confirmed must be true before target execution")
+
+    # A scope may identify targets by IP, CIDR, domain, hostname, URL, or role.
+    # Requiring an IP address made otherwise valid web/domain engagements fail
+    # before the workflow could reach authorization and execution.
+    targets = data.get("targets", {})
+    if not isinstance(targets, dict):
+        result.add_error("scope.targets must be a mapping")
+    else:
+        target_fields = ("ip_addresses", "cidrs", "domains", "hostnames", "urls", "in_scope_urls")
+        has_list_target = any(
+            isinstance(targets.get(field), list)
+            and any(str(item).strip() for item in targets.get(field, []))
+            for field in target_fields
+        )
+        roles = targets.get("roles")
+        has_role_target = isinstance(roles, dict) and any(
+            (isinstance(value, list) and any(str(item).strip() for item in value))
+            or (isinstance(value, str) and value.strip())
+            for value in roles.values()
+        )
+        if not has_list_target and not has_role_target:
+            result.add_error(
+                "scope.targets must contain at least one IP, CIDR, domain, hostname, URL, or role"
+            )
+
+    assessment_hosts = data.get("assessment_hosts", {}) or {}
+    if not isinstance(assessment_hosts, dict):
+        result.add_error("scope.assessment_hosts must be a mapping when present")
+    else:
+        callback_hosts = assessment_hosts.get("callback_hosts", []) or []
+        if not isinstance(callback_hosts, list) or any(
+            not isinstance(item, str) or not item.strip() for item in callback_hosts
+        ):
+            result.add_error("scope.assessment_hosts.callback_hosts must be a list of hosts/IPs")
+
+    # rules_of_engagement
+    roe = data.get("rules_of_engagement", {})
+    allowed_actions = roe.get("allowed_actions") if isinstance(roe, dict) else None
+    if not isinstance(allowed_actions, list) or not any(
+        str(item).strip() for item in allowed_actions
+    ):
+        result.add_error("scope.rules_of_engagement.allowed_actions must be a non-empty list")
+
+    # engagement.date
+    engagement = data.get("engagement", {})
+    if "date" not in engagement:
+        result.add_warning("scope.engagement.date missing (will be set on init)")
+
+    result.scope_data = data
+    return result
+
+
+_PHASE_ACTIONS = {
+    Phase.SCOPING: frozenset({"scope", "scoping"}),
+    Phase.RECON: frozenset(
+        {
+            "recon",
+            "discovery",
+            "host port discovery",
+            "host-port-discovery",
+            "banner grabbing",
+            "banner-grabbing",
+            "version detection",
+            "version-detection",
+            "scanning",
+            "enumeration",
+        }
+    ),
+    Phase.VULN_RESEARCH: frozenset(
+        {
+            "vulnerability research",
+            "vulnerability-research",
+            "vuln-research",
+            "research",
+            "cve-research",
+            "exploitdb",
+        }
+    ),
+    Phase.EXPLOITATION: frozenset(
+        {
+            "exploitation",
+            "exploit validation",
+            "exploit-validation",
+            "poc",
+            "poc validation",
+            "poc-validation",
+        }
+    ),
+    Phase.POST_EXPLOITATION: frozenset({"post-exploitation", "post exploitation"}),
+    Phase.PRIVESC: frozenset({"privilege escalation", "privilege-escalation", "privesc"}),
+    Phase.FLAGS: frozenset({"flags", "flag capture", "flag-capture"}),
+    Phase.REPORTING: frozenset({"report", "reporting"}),
+    Phase.RETROSPECTIVE: frozenset({"retrospective"}),
+}
+
+
+def _normalise_action(value: object) -> str:
+    return " ".join(str(value).strip().lower().replace("_", " ").replace("/", " ").split())
+
+
+def check_scope_authorization(scope: dict[str, Any] | None, phase: Phase) -> CheckResult:
+    """Ensure the approved rules of engagement allow the requested phase."""
+    result = CheckResult()
+    if not isinstance(scope, dict):
+        return result
+    roe = scope.get("rules_of_engagement") or {}
+    allowed = {_normalise_action(item) for item in roe.get("allowed_actions", []) or []}
+    forbidden = {_normalise_action(item) for item in roe.get("forbidden_actions", []) or []}
+    actions = _PHASE_ACTIONS[phase]
+    if forbidden & actions:
+        result.add_error(
+            f"phase {phase.value} conflicts with scope.rules_of_engagement.forbidden_actions"
+        )
+    if not allowed & actions:
+        result.add_error(
+            f"phase {phase.value} is not permitted by scope.rules_of_engagement.allowed_actions; "
+            f"add an allowed_actions entry containing one of: {', '.join(sorted(actions))}"
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# DANGEROUS-PATTERN ENFORCEMENT
+# ---------------------------------------------------------------------------
+
+_DESTRUCTIVE_PATTERNS: list[tuple[str, str]] = [
+    (
+        r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\b",
+        "destructive filesystem deletion (rm -rf) is blocked",
+    ),
+    (
+        r"\brm\s+-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*\b",
+        "destructive filesystem deletion (rm -fr) is blocked",
+    ),
+    (r"\bmkfs\.[a-z]+\b", "filesystem format (mkfs) is blocked"),
+    (r"\bdd\b[^\n]*\bof=/dev/", "raw device overwrite (dd of=/dev/...) is blocked"),
+    (r"\bwipefs\b", "filesystem wipe (wipefs) is blocked"),
+    (r"\bshred\b[^\n]*\b/dev/", "device shred is blocked"),
+    (r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "fork bomb is blocked"),
+    (r">\s*/dev/sd[a-z]", "overwriting a block device is blocked"),
+    (r"\bchmod\s+-R\s+0", "recursive permission wipe (chmod -R 0...) is blocked"),
+    (r"\bchown\s+-R\b", "recursive ownership change (chown -R) is blocked"),
+    (
+        r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba)?sh\b",
+        "piping a download into a shell is blocked",
+    ),
+]
+
+
+def check_destructive_patterns(command: str) -> CheckResult:
+    """Return a BLOCK if the command matches a destructive pattern."""
+    result = CheckResult()
+    for pattern, reason in _DESTRUCTIVE_PATTERNS:
+        if re.search(pattern, command):
+            result.add_error(reason)
+            break
+    return result
+
+
+def check_local_artifact_paths(command: str) -> CheckResult:
+    """Remind operators that locally-created scripts belong in the engagement."""
+    result = CheckResult()
+    if re.search(r"(?:>|\btee\s+)\s*/tmp/[^\s]+\.(?:py|pl|rb|sh)(?=\s|$)", command):
+        result.add_info("local script path uses /tmp; save it under $ENG_DIR/exploits instead")
+    return result
+
+
+def check_skill_binding(eng_dir: Path, task_id: str, session_id: str, phase: Phase) -> CheckResult:
+    """Require a delivered, current-context receipt binding for target work."""
+    result = CheckResult()
+    binding = get_binding(eng_dir, task_id)
+    if not binding:
+        result.add_error(f"skill receipt binding missing for active task {task_id}")
+        return result
+    if binding.get("session_id") != session_id:
+        result.add_error("skill receipt binding belongs to a different session")
+    current = state.read_json(eng_dir / "state" / "skills.json").get("context", {})
+    if binding.get("context_generation") != current.get("generation"):
+        result.add_error("skill receipt binding is stale after context reset")
+    if not result.errors:
+        result.add_info(f"skill receipt binding verified: {binding.get('skill')}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Hypothesis freshness gate
+# ---------------------------------------------------------------------------
+
+
+def check_hypothesis_freshness(
+    eng_dir: Path,
+    phase: Phase,
+    command: str,
+    primary_target: str | None = None,
+    hypothesis_id: str | None = None,
+) -> HypothesisResult:
+    """Ensure hypotheses exist and are fresh for phases that require them."""
+    result = HypothesisResult()
+
+    if not requires_hypothesis(phase):
+        return result
+
+    hyp_path = eng_dir / "hypotheses.md"
+    hyps = hypotheses.parse_hypotheses(hyp_path)
+
+    if not hyps:
+        result.add_error(f"phase {phase.value} requires at least one hypothesis in hypotheses.md")
+        return result
+
+    acceptable_phases = {
+        Phase.VULN_RESEARCH: {Phase.VULN_RESEARCH},
+        Phase.EXPLOITATION: {Phase.VULN_RESEARCH, Phase.EXPLOITATION},
+        Phase.POST_EXPLOITATION: {Phase.EXPLOITATION, Phase.POST_EXPLOITATION},
+        Phase.PRIVESC: {Phase.EXPLOITATION, Phase.POST_EXPLOITATION, Phase.PRIVESC},
+        Phase.FLAGS: {Phase.PRIVESC, Phase.FLAGS},
+    }.get(phase, {phase})
+    scope_path = eng_dir / "scope" / "scope.yaml"
+    scope_data = validate_scope(scope_path).scope_data if scope_path.exists() else None
+    targets = resolve_command_targets(command, primary_target=primary_target, scope_data=scope_data)
+
+    norm_hyp_id = (
+        hypothesis_id.strip().upper().removeprefix("H-").lstrip("0") or "0"
+        if hypothesis_id
+        else None
+    )
+
+    relevant = []
+    for hypothesis in hyps:
+        if hypothesis.canonical_status() == "Rejected" or not hypothesis.target:
+            continue
+        try:
+            hypothesis_phase = normalize_phase(hypothesis.phase)
+        except ValueError:
+            continue
+        target = normalise_target(hypothesis.target)
+
+        if norm_hyp_id is not None:
+            h_id = hypothesis.id.strip().upper().removeprefix("H-").lstrip("0") or "0"
+            if h_id != norm_hyp_id:
+                continue
+
+        if hypothesis_phase in acceptable_phases and (not targets or target in targets):
+            relevant.append(hypothesis)
+    if not relevant:
+        eligible = [
+            f"H-{h.id}@{normalise_target(h.target)}"
+            for h in hyps
+            if h.canonical_status() != "Rejected" and h.target
+        ]
+        msg = f"phase {phase.value} requires a non-rejected hypothesis matching the command target"
+        if norm_hyp_id:
+            msg += f" (linked H-{norm_hyp_id.zfill(3)})"
+        msg += f"; parsed targets: {', '.join(sorted(targets)) or 'none'}; available hypotheses: {', '.join(eligible) or 'none'}"
+        result.add_error(msg)
+        return result
+
+    if phase in {
+        Phase.EXPLOITATION,
+        Phase.POST_EXPLOITATION,
+        Phase.PRIVESC,
+        Phase.FLAGS,
+    }:
+        researched = [h for h in relevant if h.cve_research.strip() and h.exploit_research.strip()]
+        if not researched:
+            missing = []
+            for h in relevant:
+                fields = []
+                if not h.cve_research.strip():
+                    fields.append("CVE Research")
+                if not h.exploit_research.strip():
+                    fields.append("Exploit Research")
+                missing.append(f"H-{h.id} missing {' and '.join(fields)}")
+            result.add_error(
+                "online research must be attempted and recorded before exploit execution; "
+                + "; ".join(missing)
+                + ". Record each query/source and outcome; 'no results', 'not applicable', "
+                "or 'source unavailable' are valid outcomes when truthful."
+            )
+            return result
+
+    # Check for stale hypotheses (no update in 48h)
+    stale = 0
+    now = datetime.now(UTC)
+    for h in hyps:
+        if not h.updated:
+            continue
+        ts = None
+        raw = h.updated.strip()
+        candidate = raw.removesuffix(" UTC").removesuffix("Z").strip()
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                ts = datetime.strptime(candidate, fmt)
+                break
+            except ValueError:
+                continue
+        if ts is None:
+            continue
+        ts = ts.replace(tzinfo=UTC)
+        if (now - ts).total_seconds() > 48 * 3600:
+            stale += 1
+
+    if stale:
+        result.add_warning(f"hypothesis guard: {stale} hypothesis(es) not updated in 48h")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Main check-command orchestrator
+# ---------------------------------------------------------------------------
+
+
+def check_command(args: CheckCommandArgs) -> CheckResult:
+    """Run all sub-guards for a target command."""
+    eng_dir = state.resolve_eng_dir(args.eng_dir)
+    canonical_scope_path = (eng_dir / "scope" / "scope.yaml").resolve()
+    requested_scope_path = (
+        Path(args.scope).expanduser().resolve() if args.scope else canonical_scope_path
+    )
+    scope_path = canonical_scope_path
+    phase = normalize_phase(args.phase)
+
+    result = CheckResult()
+
+    if requested_scope_path != canonical_scope_path:
+        result.add_error(
+            "runtime execution must use the engagement's canonical scope.yaml; "
+            "validate alternate scope files separately with validate-scope"
+        )
+
+    # 1. Bootstrap completeness
+    bootstrap_result = bootstrap.check_bootstrap(str(eng_dir), auto_repair=False)
+    result.errors.extend(bootstrap_result.errors)
+    result.warnings.extend(bootstrap_result.warnings)
+    result.infos.extend(bootstrap_result.infos)
+
+    # 2. Scope validation
+    scope_result = validate_scope(scope_path)
+    result.errors.extend(scope_result.errors)
+    result.warnings.extend(scope_result.warnings)
+
+    authorisation_result = check_scope_authorization(scope_result.scope_data, phase)
+    result.errors.extend(authorisation_result.errors)
+
+    # 2b. Scope target enforcement
+    target_result = check_scope_targets(scope_path, args.command, args.target)
+    result.errors.extend(target_result.errors)
+    result.warnings.extend(target_result.warnings)
+
+    # 2c. Destructive-pattern hard block
+    destructive_result = check_destructive_patterns(args.command)
+    result.errors.extend(destructive_result.errors)
+
+    artifact_result = check_local_artifact_paths(args.command)
+    result.infos.extend(artifact_result.infos)
+
+    # 3. Session identity gate
+    session_id = state.resolve_session_id(eng_dir, args.session_id)
+    if not session_id:
+        result.add_error("session_id is required for the skill receipt gate")
+
+    # 4. PTT active task
+    ptt_path = eng_dir / "state" / "ptt.md"
+    ptt_validation = ptt.validate_ptt(ptt.parse_ptt(ptt_path))
+    result.errors.extend(ptt_validation.errors)
+    result.warnings.extend(ptt_validation.warnings)
+    active_task_hyp_id = None
+    if ptt_validation.active_task:
+        result.infos.append(f"active PTT task: {ptt_validation.active_task}")
+        active_task = ptt.find_active_task(ptt_validation.tasks)
+        if active_task and not ptt.task_matches_phase(active_task, phase):
+            result.add_error(
+                f"active PTT task {active_task.id} belongs to {active_task.phase or 'no phase'}; "
+                f"requested phase is {phase.value}. Next: call pends_status, then close or "
+                "pause the current task and start one under the requested Phase heading with "
+                "pends_record_ptt"
+            )
+        if active_task and active_task.note:
+            hyp_match = re.search(r"\bH-\d+\b", active_task.note, re.IGNORECASE)
+            if hyp_match:
+                active_task_hyp_id = hyp_match.group(0).upper()
+        if active_task and session_id:
+            binding_result = check_skill_binding(eng_dir, active_task.id, session_id, phase)
+            result.errors.extend(binding_result.errors)
+            result.warnings.extend(binding_result.warnings)
+            result.infos.extend(binding_result.infos)
+
+    semantic_lock = state.semantic_lock(eng_dir)
+    if semantic_lock:
+        result.add_error(
+            "semantic anti-stuck lock: five evidence-poor reviews require a recorded research "
+            "attempt plus a meaningful next_technique pivot before target execution"
+        )
+
+    # 5. History staleness (duplicate detection)
+    pending = state.get_pending_sync(str(eng_dir)) or {}
+    pending_commands = {str(item.get("command") or "") for item in pending.get("commands") or []}
+    h_errors, h_warnings, h_infos = history_mod.check_history_staleness(
+        eng_dir, args.command, allow_pending_repeat=args.command in pending_commands
+    )
+    result.errors.extend(h_errors)
+    result.warnings.extend(h_warnings)
+    result.infos.extend(h_infos)
+
+    # 6. Hypothesis freshness
+    hyp_result = check_hypothesis_freshness(
+        eng_dir, phase, args.command, args.target, hypothesis_id=active_task_hyp_id
+    )
+    result.errors.extend(hyp_result.errors)
+    result.warnings.extend(hyp_result.warnings)
+    result.infos.extend(hyp_result.infos)
+
+    # 7. Sync/heartbeat state
+    sync_pending = state.get_pending_sync(str(eng_dir))
+    if sync_pending:
+        credit = state.sync_credit_remaining(str(eng_dir), phase.value)
+        last_command = (sync_pending.get("commands") or [{}])[-1].get(
+            "command", sync_pending.get("command", "prior command")
+        )
+        if credit == 0:
+            result.add_error(
+                f"prior command's artifacts not synced: {last_command} "
+                f"(phase: {sync_pending.get('phase')}). Next: review the batch evidence and call "
+                "pends_review_batch with the active PTT task and a truthful note"
+            )
+        else:
+            result.add_info(
+                f"bounded batch in progress after: {last_command} "
+                f"(phase: {sync_pending.get('phase')}); {credit} credit(s) remain"
+            )
+
+    # 8. Sync-credit window exhausted
+    credit = state.sync_credit_remaining(str(eng_dir), phase.value)
+    credit_limit = int(
+        (sync_pending or {}).get("credit_limit") or state.sync_credit_limit(phase.value)
+    )
+    result.infos.append(f"sync credit remaining: {credit}/{credit_limit}")
+    if credit == 0:
+        result.add_error(
+            "sync-credit window exhausted; review the saved batch evidence, then call "
+            "pends_review_batch"
+        )
+
+    # 9. Heartbeat gate (set after every COMMAND_INTERVAL executed commands).
+    # Execution owns the command count and creates the heartbeat lock after the
+    # threshold command succeeds. Preflight only enforces that existing lock;
+    # predicting the next count here would permanently block the threshold
+    # command because blocked attempts do not advance the counter.
+    if not suppresses_heartbeat(phase) and state.has_heartbeat_pending(str(eng_dir)):
+        reason = state.get_heartbeat_reason(str(eng_dir))
+        detail = f": {reason}" if reason else ""
+        result.add_error(
+            f"heartbeat pending{detail} — review engagement state, then run pends_heartbeat_done"
+        )
+
+    return result

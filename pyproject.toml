@@ -1,0 +1,38 @@
+[project]
+name = "pends"
+version = "3.0.1"
+description = "Supervised agentic Hermes penetration-testing profile"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "bashlex>=0.18,<1",
+    "filelock>=3.13,<4",
+    "pydantic>=2.0,<3",
+    "psutil>=6.0.0,<7",
+    "netaddr>=1.3.0,<2",
+    "yarl>=1.9,<2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3,<10",
+    "pyyaml>=6.0,<7",
+    "ruff>=0.11,<0.12",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = ["engagements", ".hermes", ".agents"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "E402"]
+"scripts/**/*.py" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"

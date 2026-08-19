@@ -1,0 +1,17 @@
+from pathlib import Path
+
+from plugins.pends_guard.release import resolve_reference
+
+ROOT = Path(__file__).resolve().parent.parent
+GUARD_ROOT = ROOT
+
+
+def test_playbook_reference_paths_resolve_from_pentest_skill_root():
+    playbook = GUARD_ROOT / "skills" / "pentest" / "playbooks" / "api-security.md"
+
+    assert resolve_reference(playbook, "references/shared-safety.md") == (
+        GUARD_ROOT / "skills" / "pentest" / "references" / "shared-safety.md"
+    )
+    assert resolve_reference(playbook, "playbooks/recon.md") == (
+        GUARD_ROOT / "skills" / "pentest" / "playbooks" / "recon.md"
+    )

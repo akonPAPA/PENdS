@@ -1,0 +1,25 @@
+name: pends
+version: 3.0.1
+description: A supervised agentic Hermes penetration testing profile for authorised
+  Kali/Parrot-based security assessment, reconnaissance, exploit validation, and reporting
+  workflows.
+hermes_requires: '>=0.18.0'
+author: Pends contributors
+license: MIT
+env_requires: []
+distribution_owned:
+- distribution.yaml
+- README.md
+- CHANGELOG.md
+- LICENSE
+- SOUL.md
+- .hermes.md
+- CONTRIBUTING.md
+- SECURITY.md
+- config.yaml
+- pyproject.toml
+- skills/
+- scripts/
+- plugins/
+- assets/
+- .github/

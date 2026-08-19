@@ -1,0 +1,33 @@
+name: pends-guard
+version: 3.0.0
+description: Typed scope guards and an execute-and-record boundary with bounded synchronization
+  windows.
+kind: standalone
+provides_tools:
+- pends_check_command
+- pends_record_ptt
+- pends_record_hypothesis
+- pends_exec
+- pends_exec_status
+- pends_exec_cancel
+- pends_review_batch
+- pends_rebind_pending_batch
+- pends_heartbeat_done
+- pends_exec_burst
+- pends_target
+- pends_status
+- pends_search_exploit
+- pends_httpx
+- pends_nuclei
+- pends_ffuf
+- pends_listener
+hooks:
+- pre_tool_call
+- post_tool_call
+- pre_llm_call
+- on_session_reset
+- on_session_finalize
+toolsets:
+  pends_guard:
+    description: Pends engagement guard tools
+app_style: sh

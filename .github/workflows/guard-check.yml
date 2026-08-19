@@ -1,0 +1,42 @@
+name: guard-check
+on:
+  push:
+    branches: [master, dev]
+  pull_request:
+    branches: [master, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  guard-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install development dependencies
+        run: uv sync --dev
+      - name: Run guard release check
+        run: uv run python scripts/pends_guard.py check-release
+      - name: Validate YAML
+        run: |
+          uv run python -c "
+          import yaml
+          for f in ['distribution.yaml', 'config.yaml', 'skills/pentest/templates/scope-template.yaml']:
+              yaml.safe_load(open(f))
+              print(f'OK: {f}')
+          "
+      - name: Count playbooks
+        run: |
+          count=$(find skills -type f -path '*/playbooks/*.md' | wc -l)
+          echo "Playbooks: $count"
+          test "$count" -eq 31
+      - name: Check for stale artifacts
+        run: |
+          for stale in PLAN.md skills/pentest/scripts/recon-scan.sh; do
+            if [ -f "$stale" ]; then echo "Stale: $stale"; exit 1; fi
+          done
+          echo "No stale artifacts found"
