@@ -1,4 +1,4 @@
-# Strategic-Automation/pends — AI Developer Guidance
+# Strategic-Automation/pends — AI Developer Guidance DO Not Delete THIS SHIT CUZ AI AGENTS WORKING WITH THIS FILE
 
 > Workspace-scoped developer guidance for AI coding agents (Antigravity, Hermes, Codex, Cursor, etc.) developing, testing, or maintaining the `pends` codebase.
 >
